@@ -1,0 +1,87 @@
+#!/bin/bash
+#
+# git-clean-merged helps with cleanup of merged branches in local and remote repositories
+#
+# Copyright(c) 2026       Christoph Niethammer <christoph.niethammer@gmail.com>
+#
+
+# Default values
+BASE_BRANCH="main"
+REMOTE_TARGET="origin"
+DRYRUN=false
+PROTECTED_BRANCHES="main|master|develop"
+
+usage() {
+  echo "Usage: $0 [-b base_branch] [--dry-run] [--protected branches_regex]"
+  echo
+  echo "Options:"
+  echo "  -b, --base        Base branch to check merges against (default: $BASE_BRANCH)"
+  echo "  -n, --dry-run     Preview which branches would be deleted without deleting"
+  echo "  -p, --protected   Regex of branches to protect from deletion (default: $PROTECTED_BRANCHES)"
+  echo "  -r, --remote      Remote target to update (default: $REMOTE_TARGET)"
+  echo "  -h, --help        Show this help"
+}
+
+# Parse arguments with getopt
+TEMP=$(getopt -o b:np:r:h --long base:,dry-run,protected:,remote:,help -n "$0" -- "$@")
+# shellcheck disable="SC2181"
+if [ $? != 0 ]; then usage; exit 1; fi
+# shellcheck enable="SC2181"
+eval set -- "$TEMP"
+
+while true; do
+  case "$1" in
+    -b|--base) BASE_BRANCH="$2"; shift 2 ;;
+    -n|--dry-run) DRYRUN=true; shift ;;
+    -p|--protected) PROTECTED_BRANCHES="$2"; shift 2 ;;
+    -r|--remote) REMOTE_TARGET=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    *) echo "Invalid option: $1"; usage; exit 1 ;;
+  esac
+done
+
+echo "Base branch: $BASE_BRANCH"
+echo "Remote target: $REMOTE_TARGET"
+echo "Protected branches: $PROTECTED_BRANCHES"
+if echo "$BASE_BRANCH" | grep -vE "($PROTECTED_BRANCHES)"; then
+  echo "WARNING: Base branch '$BASE_BRANCH' is not included in protected branches pattern: $PROTECTED_BRANCHES"
+  read -r -p "Do you want to continue? [y/N] " confirm
+    case "$confirm" in
+      [yY]|[yY][eE][sS]) ;;
+      *) exit 0 ;;
+    esac
+fi
+$DRYRUN && echo "Dry run enabled — no branches will be deleted."
+
+# Fetch and prune
+git fetch --prune
+
+# Local branches
+local_branches=$(git branch --merged "$BASE_BRANCH" \
+  | grep -vE "^\*|^[[:space:]]*($PROTECTED_BRANCHES)$")
+
+if [[ -n "$local_branches" ]]; then
+  if $DRYRUN; then
+    echo "Would delete local branches:"
+    echo "$local_branches"
+  else
+    echo "$local_branches" | xargs -r -I {} git branch -d {}
+  fi
+fi
+
+# Remote branches
+remote_branches=$(git branch -r --merged "$REMOTE_TARGET/$BASE_BRANCH" \
+  | grep "$REMOTE_TARGET" \
+  | grep -vE "$REMOTE_TARGET/($PROTECTED_BRANCHES)" \
+  | sed "s/$REMOTE_TARGET\///")
+
+if [[ -n "$remote_branches" ]]; then
+  if $DRYRUN; then
+    echo "Would delete remote branches:"
+    echo "$remote_branches"
+  else
+    echo "$remote_branches" | xargs -r -I {} git push "$REMOTE_TARGET" --delete {}
+  fi
+fi
+
