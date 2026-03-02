@@ -1,11 +1,13 @@
+name: Shellcheck
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
-name: "shellcheck"
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
   shellcheck:
@@ -14,6 +16,39 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-      - name: Run ShellCheck
-        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Get list of changed files
+        if: github.event_name == 'pull_request'
+        id: changed_files
+        run: |
+          echo "Getting changed files for PR ..."
+          echo "${{github.event}}"
+          {
+            echo "ALL_CHANGED_FILES<<EOF"
+            git diff --diff-filter=d --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }}
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run shellcheck
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            FILES="${{ steps.changed_files.outputs.ALL_CHANGED_FILES }}"
+          else
+            FILES=""
+          fi
+
+          if [[ -z "$FILES" ]]; then
+            echo "Running shellcheck on all shell files"
+            find . -type f -a \( -name '*.sh' -o -name '*.bash' -o -name '*.bats' \) -exec shellcheck {} +
+          else
+            echo "Running shellcheck on changed shell files only"
+            for file in $FILES; do
+              if [[ "$file" =~ \.(sh|bash|bats)$ ]]; then
+                echo "Checking $file ..."
+                shellcheck "$file"
+              fi
+            done
+          fi
 
