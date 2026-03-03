@@ -1,0 +1,67 @@
+#!/bin/bash
+#
+# git-make-tgz helps with creating a archive file from a git repository
+#
+# Copyright(c) 2026       Christoph Niethammer <christoph.niethammer@gmail.com>
+#
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS] COMMIT
+
+Create a tar.gz archive from a git commit.
+  COMMIT       Commit, tag, or ref (default: HEAD)
+
+Options:
+  -o, --output-dir <dir>   Output directory (default: parent of repo)
+  -p, --prefix <prefix>    Custom archive prefix (default: auto-generated)
+  -h, --help               Show this help
+EOF
+}
+
+# Parse arguments with getopt
+TEMP=$(getopt -o o:p:h --long output-dir:,prefix:,help -n "$0" -- "$@")
+# shellcheck disable="SC2181"
+if [ $? != 0 ]; then usage; exit 1; fi
+# shellcheck enable="SC2181"
+eval set -- "$TEMP"
+
+while true; do
+  case "$1" in
+    -o|--output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    -p|--prefix) PREFIX="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    *) echo "Invalid option: $1"; usage; exit 1 ;;
+  esac
+done
+
+COMMIT="$1"
+if [[ -z "$COMMIT" ]]; then
+  COMMIT="HEAD"
+fi
+
+if ! git rev-parse --verify "$COMMIT^{commit}" >/dev/null 2>&1; then
+    echo "Error: Invalid commit or ref: $COMMIT"
+    exit 1
+fi
+
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+if [[ -z "$PREFIX" ]]; then
+    REPO_NAME=$(basename "$REPO_ROOT")
+    COMMIT_DATE=$(git show -s --format=%ci "$COMMIT" | awk '{print $1}')
+    ABBREV_COMMIT=$(git describe --tags --always "$COMMIT")
+    PREFIX="${REPO_NAME}-${COMMIT_DATE}-${ABBREV_COMMIT}"
+fi
+
+if [[ -z "$OUTPUT_DIR" ]]; then
+    OUTPUT_DIR="$(dirname "$REPO_ROOT")"
+fi
+
+ARCHIVE_PATH="${OUTPUT_DIR}/${PREFIX}.tar.gz"
+
+
+git archive --format=tar.gz --prefix="${PREFIX}/" "$COMMIT" > "$ARCHIVE_PATH"
+
+echo "Created archive: $ARCHIVE_PATH"
