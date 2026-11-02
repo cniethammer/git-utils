@@ -1,10 +1,13 @@
 name: Shellcheck
 
+# Pushes to main/develop and manual runs: check all shell scripts.
+# Pull requests into main/develop: check only the shell scripts changed by the PR.
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -19,36 +22,37 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get list of changed files
-        if: github.event_name == 'pull_request'
-        id: changed_files
-        run: |
-          echo "Getting changed files for PR ..."
-          echo "${{github.event}}"
-          {
-            echo "ALL_CHANGED_FILES<<EOF"
-            git diff --diff-filter=d --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }}
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Run shellcheck
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            FILES="${{ steps.changed_files.outputs.ALL_CHANGED_FILES }}"
+          # Shell scripts: by extension or by shebang
+          is_shell() {
+            local first=""
+            [[ $1 =~ \.(sh|bash|bats)$ ]] && return 0
+            IFS= read -r first < "$1" || true
+            [[ $first =~ ^#!.*[/[:space:]](ba)?sh([[:space:]]|$) ]]
+          }
+
+          if [[ $EVENT == pull_request ]]; then
+            echo "Checking shell files changed in this PR"
+            files=$(git diff --diff-filter=d --name-only "$BASE_SHA...$HEAD_SHA")
           else
-            FILES=""
+            echo "Checking all shell files"
+            files=$(git ls-files)
           fi
 
-          if [[ -z "$FILES" ]]; then
-            echo "Running shellcheck on all shell files"
-            find . -type f -a \( -name '*.sh' -o -name '*.bash' -o -name '*.bats' \) -exec shellcheck {} +
-          else
-            echo "Running shellcheck on changed shell files only"
-            for file in $FILES; do
-              if [[ "$file" =~ \.(sh|bash|bats)$ ]]; then
-                echo "Checking $file ..."
-                shellcheck "$file"
-              fi
-            done
-          fi
+          rc=0
+          checked=0
+          while IFS= read -r file; do
+            [[ -n $file && -f $file ]] || continue
+            is_shell "$file" || continue
+            echo "Checking $file ..."
+            checked=$((checked + 1))
+            shellcheck -- "$file" || rc=1
+          done <<< "$files"
 
+          echo "Checked $checked file(s)."
+          exit "$rc"
