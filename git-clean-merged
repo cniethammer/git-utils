@@ -4,10 +4,29 @@
 #
 # Copyright(c) 2026       Christoph Niethammer <christoph.niethammer@gmail.com>
 #
+# Every expected failure is handled explicitly below. As a safety net, any
+# other failing command ends the script via on_error with a clear message
+# and the documented exit status (see usage). -E makes the trap apply inside
+# functions too; avoid process substitution, where it would fire spuriously.
+set -eE
+#set -x
+
+DELETION_STARTED=false   # set before the first branch is deleted
+
+# shellcheck disable=SC2329  # invoked via the ERR trap, which shellcheck cannot see
+on_error() {
+  local rc=$?
+  # In a $(...) subshell just pass the status on; the main shell reports it
+  (( BASHPID == $$ )) || exit "$rc"
+  trap - ERR
+  echo "ERROR: unexpected failure (exit status $rc) at line ${BASH_LINENO[0]}: $BASH_COMMAND" >&2
+  if $DELETION_STARTED; then exit 2; else exit 1; fi
+}
+trap on_error ERR
 
 # Default values
-BASE_BRANCH="main"
-REMOTE_TARGET="origin"
+BASE_BRANCH=""   # empty: detect from $REMOTE_TARGET/HEAD
+REMOTE_TARGET=""   # empty: detect (push remote, upstream, sole remote, origin)
 DRYRUN=false
 PROTECTED_BRANCHES="main|master|develop"
 
@@ -15,18 +34,86 @@ usage() {
   echo "Usage: $0 [-b base_branch] [--dry-run] [--protected branches_regex]"
   echo
   echo "Options:"
-  echo "  -b, --base        Base branch to check merges against (default: $BASE_BRANCH)"
+  echo "  -b, --base        Base branch to check merges against (default: default branch of the remote)"
   echo "  -n, --dry-run     Preview which branches would be deleted without deleting"
   echo "  -p, --protected   Regex of branches to protect from deletion (default: $PROTECTED_BRANCHES)"
-  echo "  -r, --remote      Remote target to update (default: $REMOTE_TARGET)"
+  echo "  -r, --remote      Remote target to update (default: push remote of the current branch)"
   echo "  -h, --help        Show this help"
+  echo
+  echo "Exit status:"
+  echo "  0  all selected branches were deleted (or would be, in a dry run)"
+  echo "  1  error before anything was deleted (invalid options, setup problems)"
+  echo "  2  partial cleanup: a deletion failed or the remote cleanup was skipped"
+}
+
+# Return 0 if $1 matches the protected pattern as a whole name
+is_protected() {
+  local rc=0
+  grep -qxE -- "$PROTECTED_BRANCHES" <<< "$1" || rc=$?
+  if (( rc == 2 )); then
+    echo "ERROR: invalid --protected regex: $PROTECTED_BRANCHES" >&2
+    exit 1
+  fi
+  return "$rc"
+}
+
+# Add $1 as a literal name to PROTECTED_BRANCHES unless it already matches;
+# $2 describes the branch in the warning
+ensure_protected() {
+  local c i escaped=""
+  is_protected "$1" && return 0
+  echo "WARNING: $2 is not matched by the protected pattern; protecting it automatically" >&2
+  # Put regex metacharacters into bracket expressions so the name matches literally
+  # (git already forbids * ? [ ^ \ in branch names)
+  for (( i = 0; i < ${#1}; i++ )); do
+    c=${1:i:1}
+    if [[ '].+(){}|$' == *"$c"* ]]; then escaped+="[$c]"; else escaped+=$c; fi
+  done
+  PROTECTED_BRANCHES="$PROTECTED_BRANCHES|$escaped"
+}
+
+# Exit unless git is at least 2.23 (needed for for-each-ref %(worktreepath))
+check_git_version() {
+  local version major minor
+  if ! version=$(git --version 2>/dev/null); then   # e.g. "git version 2.39.3 (Apple Git-145)"
+    echo "ERROR: git not found" >&2
+    exit 1
+  fi
+  IFS=. read -r major minor _ <<< "${version#git version }"
+  if ! [[ $major =~ ^[0-9]+$ && $minor =~ ^[0-9]+$ ]] ||
+     (( major < 2 || (major == 2 && minor < 23) )); then
+    echo "ERROR: git 2.23 or newer is required (found: $version)" >&2
+    exit 1
+  fi
+}
+
+# Print the remote to clean up; return 1 if none can be determined
+detect_remote() {
+  local branch key remote remotes
+  if branch=$(git symbolic-ref --quiet --short HEAD); then
+    for key in "branch.$branch.pushRemote" remote.pushDefault "branch.$branch.remote"; do
+      if remote=$(git config --get "$key") && [[ $remote != . ]]; then
+        echo "$remote"; return 0
+      fi
+    done
+  elif remote=$(git config --get remote.pushDefault); then
+    echo "$remote"; return 0
+  fi
+  remotes=$(git remote)
+  if [[ -n $remotes && $remotes != *$'\n'* ]]; then   # exactly one remote
+    echo "$remotes"; return 0
+  fi
+  if git remote get-url origin >/dev/null 2>&1; then
+    echo origin; return 0
+  fi
+  return 1
 }
 
 # Parse arguments with getopt
-TEMP=$(getopt -o b:np:r:h --long base:,dry-run,protected:,remote:,help -n "$0" -- "$@")
-# shellcheck disable="SC2181"
-if [ $? != 0 ]; then usage; exit 1; fi
-# shellcheck enable="SC2181"
+if ! TEMP=$(getopt -o b:np:r:h --long base:,dry-run,protected:,remote:,help -n "$0" -- "$@"); then
+  usage >&2
+  exit 1
+fi
 eval set -- "$TEMP"
 
 while true; do
@@ -37,51 +124,183 @@ while true; do
     -r|--remote) REMOTE_TARGET=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
-    *) echo "Invalid option: $1"; usage; exit 1 ;;
+    *) echo "Invalid option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
+
+check_git_version
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "ERROR: not inside a git repository" >&2
+  exit 1
+fi
+
+if [[ -z $REMOTE_TARGET ]] && ! REMOTE_TARGET=$(detect_remote); then
+  remotes=$(git remote)
+  if [[ -z $remotes ]]; then
+    echo "ERROR: no remotes configured in this repository." >&2
+    echo "Add one with: git remote add <name> <url>" >&2
+  else
+    echo "ERROR: cannot detect which remote to clean up; found: ${remotes//$'\n'/ }" >&2
+    echo "Pass -r <remote>, or set a default with: git config remote.pushDefault <remote>" >&2
+  fi
+  exit 1
+fi
+
+if ! git remote get-url "$REMOTE_TARGET" >/dev/null 2>&1; then
+  echo "ERROR: remote '$REMOTE_TARGET' does not exist; configured remotes: $(git remote | tr '\n' ' ')" >&2
+  exit 1
+fi
+
+# Fetch and prune first, so remote refs and $REMOTE_TARGET/HEAD are current
+if ! git fetch --prune "$REMOTE_TARGET"; then
+  echo "ERROR: fetching from remote '$REMOTE_TARGET' failed" >&2
+  exit 1
+fi
+
+# Default branch of the remote: from the local $REMOTE_TARGET/HEAD ref,
+# else ask the server
+REMOTE_DEFAULT=""
+if head_ref=$(git symbolic-ref --quiet "refs/remotes/$REMOTE_TARGET/HEAD"); then
+  REMOTE_DEFAULT=${head_ref#"refs/remotes/$REMOTE_TARGET/"}
+else
+  # Output line of interest: "ref: refs/heads/<branch><TAB>HEAD"
+  ls_remote=$(git ls-remote --symref "$REMOTE_TARGET" HEAD 2>/dev/null || true)
+  while IFS=$'\t' read -r ref name; do
+    if [[ $name == HEAD && $ref == "ref: refs/heads/"* ]]; then
+      REMOTE_DEFAULT=${ref#"ref: refs/heads/"}
+    fi
+  done <<< "$ls_remote"
+fi
+
+if [[ -z $BASE_BRANCH ]]; then
+  if [[ -n $REMOTE_DEFAULT ]]; then
+    BASE_BRANCH=$REMOTE_DEFAULT
+  else
+    echo "ERROR: cannot detect base branch: default branch of remote '$REMOTE_TARGET' is unknown." >&2
+    echo "Pass -b <branch>, or run: git remote set-head $REMOTE_TARGET --auto" >&2
+    exit 1
+  fi
+fi
+
+status=0   # becomes 2 on partial cleanup, see usage
+
+# Always protect the base branch and the remote's default branch
+ensure_protected "$BASE_BRANCH" "Base branch '$BASE_BRANCH'"
+if [[ -z $REMOTE_DEFAULT ]]; then
+  echo "WARNING: default branch of remote '$REMOTE_TARGET' is unknown, so it cannot be protected;" \
+    "remote branches will NOT be deleted. Fix with: git remote set-head $REMOTE_TARGET <branch>" >&2
+  status=2
+elif [[ $REMOTE_DEFAULT != "$BASE_BRANCH" ]]; then
+  ensure_protected "$REMOTE_DEFAULT" "Default branch '$REMOTE_DEFAULT' of remote '$REMOTE_TARGET'"
+fi
+
+# The base branch must exist locally, on the remote, or both
+local_base="refs/heads/$BASE_BRANCH"
+remote_base="refs/remotes/$REMOTE_TARGET/$BASE_BRANCH"
+has_local_base=false
+has_remote_base=false
+git rev-parse --verify --quiet "$local_base^{commit}" >/dev/null && has_local_base=true
+git rev-parse --verify --quiet "$remote_base^{commit}" >/dev/null && has_remote_base=true
+if ! $has_local_base && ! $has_remote_base; then
+  echo "ERROR: base branch '$BASE_BRANCH' exists neither locally nor on remote '$REMOTE_TARGET'" >&2
+  exit 1
+fi
+if ! $has_local_base; then
+  echo "NOTE: no local branch '$BASE_BRANCH'; checking local branches against '$REMOTE_TARGET/$BASE_BRANCH'" >&2
+  local_base=$remote_base
+fi
+if ! $has_remote_base; then
+  echo "WARNING: base branch '$BASE_BRANCH' does not exist on remote '$REMOTE_TARGET';" \
+    "remote branches will NOT be deleted" >&2
+  status=2
+fi
 
 echo "Base branch: $BASE_BRANCH"
 echo "Remote target: $REMOTE_TARGET"
 echo "Protected branches: $PROTECTED_BRANCHES"
-if echo "$BASE_BRANCH" | grep -vE "($PROTECTED_BRANCHES)"; then
-  echo "WARNING: Base branch '$BASE_BRANCH' is not included in protected branches pattern: $PROTECTED_BRANCHES"
-  read -r -p "Do you want to continue? [y/N] " confirm
-    case "$confirm" in
-      [yY]|[yY][eE][sS]) ;;
-      *) exit 0 ;;
-    esac
-fi
 $DRYRUN && echo "Dry run enabled — no branches will be deleted."
 
-# Fetch and prune
-git fetch --prune
-
 # Local branches
-local_branches=$(git branch --merged "$BASE_BRANCH" \
-  | grep -vE "^\*|^[[:space:]]*($PROTECTED_BRANCHES)$")
+current_ref=$(git symbolic-ref --quiet HEAD || true)  # empty on detached HEAD
+refs=$(git for-each-ref --format='%(refname)%09%(worktreepath)' \
+  --merged "$local_base" refs/heads/)
+local_branches=()
+while IFS=$'\t' read -r ref worktree; do
+  [[ -z $ref ]] && continue
+  branch=${ref#refs/heads/}
+  if [[ $ref == "$current_ref" ]]; then
+    echo "Skipping '$branch': currently checked out" >&2
+    continue
+  fi
+  if [[ $branch == "$BASE_BRANCH" ]]; then
+    echo "Skipping '$branch': base branch" >&2
+    continue
+  fi
+  if is_protected "$branch"; then
+    echo "Skipping '$branch': protected" >&2
+    continue
+  fi
+  if [[ -n $worktree ]]; then
+    echo "Skipping '$branch': checked out in worktree $worktree" >&2
+    continue
+  fi
+  local_branches+=("$branch")
+done <<< "$refs"
 
-if [[ -n "$local_branches" ]]; then
+if (( ${#local_branches[@]} )); then
   if $DRYRUN; then
     echo "Would delete local branches:"
-    echo "$local_branches"
+    printf '  %s\n' "${local_branches[@]}"
   else
-    echo "$local_branches" | xargs -r -I {} git branch -d {}
+    DELETION_STARTED=true
+    for branch in "${local_branches[@]}"; do
+      if ! git branch -d "$branch"; then
+        echo "ERROR: failed to delete local branch '$branch'" >&2
+        status=2
+      fi
+    done
   fi
 fi
 
-# Remote branches
-remote_branches=$(git branch -r --merged "$REMOTE_TARGET/$BASE_BRANCH" \
-  | grep "$REMOTE_TARGET" \
-  | grep -vE "$REMOTE_TARGET/($PROTECTED_BRANCHES)" \
-  | sed "s/$REMOTE_TARGET\///")
+# Remote branches (skipped entirely if the remote's default branch is unknown
+# or the base branch does not exist on the remote)
+remote_prefix="refs/remotes/$REMOTE_TARGET/"
+refs=""
+if [[ -n $REMOTE_DEFAULT ]] && $has_remote_base; then
+  refs=$(git for-each-ref --format='%(refname)' \
+    --merged "$remote_base" "$remote_prefix")
+fi
+remote_branches=()
+while IFS= read -r ref; do
+  [[ -z $ref ]] && continue
+  branch=${ref#"$remote_prefix"}
+  [[ $branch == HEAD ]] && continue
+  if [[ $branch == "$BASE_BRANCH" ]]; then
+    echo "Skipping '$REMOTE_TARGET/$branch': base branch" >&2
+    continue
+  fi
+  if is_protected "$branch"; then
+    echo "Skipping '$REMOTE_TARGET/$branch': protected" >&2
+    continue
+  fi
+  remote_branches+=("$branch")
+done <<< "$refs"
 
-if [[ -n "$remote_branches" ]]; then
+if (( ${#remote_branches[@]} )); then
   if $DRYRUN; then
     echo "Would delete remote branches:"
-    echo "$remote_branches"
+    printf '  %s\n' "${remote_branches[@]}"
   else
-    echo "$remote_branches" | xargs -r -I {} git push "$REMOTE_TARGET" --delete {}
+    DELETION_STARTED=true
+    if ! git push "$REMOTE_TARGET" --delete "${remote_branches[@]}"; then
+      echo "ERROR: deleting branches on remote '$REMOTE_TARGET' failed (see git output above)" >&2
+      status=2
+    fi
   fi
 fi
 
+if (( status != 0 )); then
+  echo "Cleanup finished with errors (exit status $status)." >&2
+fi
+exit "$status"
