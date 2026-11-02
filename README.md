@@ -6,6 +6,9 @@ git-utils provides a collection of utilities and additional subcommands for dail
 ### Prerequisites
 The tools should work with current Git and Bash versions.
 
+Minimum versions:
+- `git-clean-merged`: Git 2.23 or newer, Bash 4 or newer
+
 
 ### Installation
 Clone the repository and make the scripts available on your `PATH` or call them via `git` from the clone directory.
