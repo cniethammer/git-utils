@@ -13,7 +13,9 @@ set -eE
 
 DELETION_STARTED=false   # set before the first branch is deleted
 
-# shellcheck disable=SC2329  # invoked via the ERR trap, which shellcheck cannot see
+# Invoked via the ERR trap, which shellcheck cannot see. Reported as SC2329
+# by shellcheck >= 0.11 and as SC2317 by older versions.
+# shellcheck disable=SC2317,SC2329
 on_error() {
   local rc=$?
   # In a $(...) subshell just pass the status on; the main shell reports it
