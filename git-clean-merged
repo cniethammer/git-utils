@@ -13,6 +13,15 @@ set -eE
 
 DELETION_STARTED=false   # set before the first branch is deleted
 
+# Colors: O_* for stdout, E_* for stderr; empty until setup_colors enables them
+O_BOLD="" O_DIM="" O_GREEN="" O_YELLOW="" O_RED="" O_RESET=""
+E_BOLD="" E_YELLOW="" E_RED="" E_CYAN="" E_RESET=""
+
+error() { echo "${E_RED}${E_BOLD}error:${E_RESET} $*" >&2; }
+warn()  { echo "${E_YELLOW}${E_BOLD}warning:${E_RESET} $*" >&2; }
+note()  { echo "${E_CYAN}note:${E_RESET} $*" >&2; }
+hint()  { echo "${E_CYAN}hint:${E_RESET} $*" >&2; }
+
 # Invoked via the ERR trap, which shellcheck cannot see. Reported as SC2329
 # by shellcheck >= 0.11 and as SC2317 by older versions.
 # shellcheck disable=SC2317,SC2329
@@ -21,7 +30,7 @@ on_error() {
   # In a $(...) subshell just pass the status on; the main shell reports it
   (( BASHPID == $$ )) || exit "$rc"
   trap - ERR
-  echo "ERROR: unexpected failure (exit status $rc) at line ${BASH_LINENO[0]}: $BASH_COMMAND" >&2
+  error "unexpected failure (exit status $rc) at line ${BASH_LINENO[0]}: $BASH_COMMAND"
   if $DELETION_STARTED; then exit 2; else exit 1; fi
 }
 trap on_error ERR
@@ -31,16 +40,20 @@ BASE_BRANCH=""   # empty: detect from $REMOTE_TARGET/HEAD
 REMOTE_TARGET=""   # empty: detect (push remote, upstream, sole remote, origin)
 DRYRUN=false
 PROTECTED_BRANCHES="main|master|develop"
+COLOR=auto
 
 usage() {
-  echo "Usage: $0 [-b base_branch] [--dry-run] [--protected branches_regex]"
+  echo "Usage: ${0##*/} [options]"
+  echo
+  echo "Delete local and remote branches that are merged into the base branch."
   echo
   echo "Options:"
-  echo "  -b, --base        Base branch to check merges against (default: default branch of the remote)"
-  echo "  -n, --dry-run     Preview which branches would be deleted without deleting"
-  echo "  -p, --protected   Regex of branches to protect from deletion (default: $PROTECTED_BRANCHES)"
-  echo "  -r, --remote      Remote target to update (default: push remote of the current branch)"
-  echo "  -h, --help        Show this help"
+  echo "  -b, --base <branch>       Base branch to check merges against (default: default branch of the remote)"
+  echo "  -n, --dry-run             Preview which branches would be deleted without deleting"
+  echo "  -p, --protected <regex>   Regex of branches to protect from deletion (default: $PROTECTED_BRANCHES)"
+  echo "  -r, --remote <remote>     Remote target to update (default: push remote of the current branch)"
+  echo "      --color[=<when>]      Colorize output: always, never or auto (default: auto)"
+  echo "  -h, --help                Show this help"
   echo
   echo "Exit status:"
   echo "  0  all selected branches were deleted (or would be, in a dry run)"
@@ -48,12 +61,41 @@ usage() {
   echo "  2  partial cleanup: a deletion failed or the remote cleanup was skipped"
 }
 
+# Print "true" if a stream should be colored in auto mode; $1 is "true" if
+# the stream is a terminal. Colors also need TERM other than dumb, NO_COLOR
+# unset, and git's color.ui (or color.cleanmerged) not saying otherwise.
+auto_color() {
+  local tty=$1
+  if [[ -n ${NO_COLOR-} ]]; then echo false; return 0; fi
+  if [[ ${TERM:-dumb} == dumb ]]; then tty=false; fi
+  git config --get-colorbool color.cleanmerged "$tty" 2>/dev/null || echo "$tty"
+}
+
+# Enable colors per stream according to $1 (always, never, auto)
+setup_colors() {
+  local out err tty_out=false tty_err=false
+  # Test for a terminal here: inside $(...) stdout is always a pipe
+  if [[ -t 1 ]]; then tty_out=true; fi
+  if [[ -t 2 ]]; then tty_err=true; fi
+  case $1 in
+    always) out=true; err=true ;;
+    never) out=false; err=false ;;
+    auto) out=$(auto_color "$tty_out"); err=$(auto_color "$tty_err") ;;
+  esac
+  if [[ $out == true ]]; then
+    O_BOLD=$'\e[1m' O_DIM=$'\e[2m' O_GREEN=$'\e[32m' O_YELLOW=$'\e[33m' O_RED=$'\e[31m' O_RESET=$'\e[0m'
+  fi
+  if [[ $err == true ]]; then
+    E_BOLD=$'\e[1m' E_YELLOW=$'\e[33m' E_RED=$'\e[31m' E_CYAN=$'\e[36m' E_RESET=$'\e[0m'
+  fi
+}
+
 # Return 0 if $1 matches the protected pattern as a whole name
 is_protected() {
   local rc=0
   grep -qxE -- "$PROTECTED_BRANCHES" <<< "$1" || rc=$?
   if (( rc == 2 )); then
-    echo "ERROR: invalid --protected regex: $PROTECTED_BRANCHES" >&2
+    error "invalid --protected regex: $PROTECTED_BRANCHES"
     exit 1
   fi
   return "$rc"
@@ -64,7 +106,7 @@ is_protected() {
 ensure_protected() {
   local c i escaped=""
   is_protected "$1" && return 0
-  echo "WARNING: $2 is not matched by the protected pattern; protecting it automatically" >&2
+  warn "$2 is not matched by the protected pattern; protecting it automatically"
   # Put regex metacharacters into bracket expressions so the name matches literally
   # (git already forbids * ? [ ^ \ in branch names)
   for (( i = 0; i < ${#1}; i++ )); do
@@ -78,13 +120,13 @@ ensure_protected() {
 check_git_version() {
   local version major minor
   if ! version=$(git --version 2>/dev/null); then   # e.g. "git version 2.39.3 (Apple Git-145)"
-    echo "ERROR: git not found" >&2
+    error "git not found"
     exit 1
   fi
   IFS=. read -r major minor _ <<< "${version#git version }"
   if ! [[ $major =~ ^[0-9]+$ && $minor =~ ^[0-9]+$ ]] ||
      (( major < 2 || (major == 2 && minor < 23) )); then
-    echo "ERROR: git 2.23 or newer is required (found: $version)" >&2
+    error "git 2.23 or newer is required (found: $version)"
     exit 1
   fi
 }
@@ -111,8 +153,51 @@ detect_remote() {
   return 1
 }
 
-# Parse arguments with getopt
-if ! TEMP=$(getopt -o b:np:r:h --long base:,dry-run,protected:,remote:,help -n "$0" -- "$@"); then
+# ---- Report: rows are collected per section and printed by print_section
+
+ROW_NAMES=() ROW_STATES=() ROW_COLORS=()
+SKIP_NAMES=() SKIP_REASONS=()
+n_deleted=0 n_failed=0 n_skipped=0
+
+add_row() { ROW_NAMES+=("$1"); ROW_STATES+=("$2"); ROW_COLORS+=("$3"); }
+skip()    { SKIP_NAMES+=("$1"); SKIP_REASONS+=("$2"); }
+
+# Append the collected skipped branches as rows after the deletions
+add_skip_rows() {
+  local i
+  for i in "${!SKIP_NAMES[@]}"; do
+    add_row "${SKIP_NAMES[i]}" "skipped: ${SKIP_REASONS[i]}" "$O_DIM"
+  done
+  n_skipped=$(( n_skipped + ${#SKIP_NAMES[@]} ))
+  SKIP_NAMES=() SKIP_REASONS=()
+}
+
+# Print title $1 and the collected rows as an aligned table, then reset them;
+# $2 (optional) replaces the rows with a message, e.g. why the section was skipped
+print_section() {
+  local i width=0
+  echo
+  echo "${O_BOLD}$1${O_RESET}"
+  if [[ -n ${2-} ]]; then
+    echo "  ${O_YELLOW}$2${O_RESET}"
+  elif (( ${#ROW_NAMES[@]} == 0 )); then
+    echo "  ${O_DIM}no merged branches${O_RESET}"
+  fi
+  for i in "${!ROW_NAMES[@]}"; do
+    if (( ${#ROW_NAMES[i]} > width )); then width=${#ROW_NAMES[i]}; fi
+  done
+  for i in "${!ROW_NAMES[@]}"; do
+    printf '  %-*s  %s%s%s\n' "$width" "${ROW_NAMES[i]}" "${ROW_COLORS[i]}" "${ROW_STATES[i]}" "$O_RESET"
+  done
+  ROW_NAMES=() ROW_STATES=() ROW_COLORS=()
+}
+
+# "1 branch", "2 branches"
+branches() { if (( $1 == 1 )); then echo "1 branch"; else echo "$1 branches"; fi; }
+
+# ---- Arguments
+
+if ! TEMP=$(getopt -o b:np:r:h --long base:,dry-run,protected:,remote:,color::,help -n "${0##*/}" -- "$@"); then
   usage >&2
   exit 1
 fi
@@ -124,39 +209,55 @@ while true; do
     -n|--dry-run) DRYRUN=true; shift ;;
     -p|--protected) PROTECTED_BRANCHES="$2"; shift 2 ;;
     -r|--remote) REMOTE_TARGET=$2; shift 2 ;;
+    --color)
+      case ${2:-always} in   # plain --color means always, like git
+        always|never|auto) COLOR=${2:-always} ;;
+        *) error "invalid --color value '$2' (expected always, never or auto)"; exit 1 ;;
+      esac
+      shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
-    *) echo "Invalid option: $1" >&2; usage >&2; exit 1 ;;
+    *) error "invalid option: $1"; usage >&2; exit 1 ;;
   esac
 done
+
+if (( $# > 0 )); then
+  error "unexpected argument: $1"
+  usage >&2
+  exit 1
+fi
+
+setup_colors "$COLOR"
+
+# ---- Setup and checks
 
 check_git_version
 
 if ! git rev-parse --git-dir >/dev/null 2>&1; then
-  echo "ERROR: not inside a git repository" >&2
+  error "not inside a git repository"
   exit 1
 fi
 
 if [[ -z $REMOTE_TARGET ]] && ! REMOTE_TARGET=$(detect_remote); then
   remotes=$(git remote)
   if [[ -z $remotes ]]; then
-    echo "ERROR: no remotes configured in this repository." >&2
-    echo "Add one with: git remote add <name> <url>" >&2
+    error "no remotes configured in this repository"
+    hint "add one with: git remote add <name> <url>"
   else
-    echo "ERROR: cannot detect which remote to clean up; found: ${remotes//$'\n'/ }" >&2
-    echo "Pass -r <remote>, or set a default with: git config remote.pushDefault <remote>" >&2
+    error "cannot detect which remote to clean up; found: ${remotes//$'\n'/ }"
+    hint "pass -r <remote>, or set a default with: git config remote.pushDefault <remote>"
   fi
   exit 1
 fi
 
 if ! git remote get-url "$REMOTE_TARGET" >/dev/null 2>&1; then
-  echo "ERROR: remote '$REMOTE_TARGET' does not exist; configured remotes: $(git remote | tr '\n' ' ')" >&2
+  error "remote '$REMOTE_TARGET' does not exist; configured remotes: $(git remote | tr '\n' ' ')"
   exit 1
 fi
 
 # Fetch and prune first, so remote refs and $REMOTE_TARGET/HEAD are current
-if ! git fetch --prune "$REMOTE_TARGET"; then
-  echo "ERROR: fetching from remote '$REMOTE_TARGET' failed" >&2
+if ! git fetch --quiet --prune "$REMOTE_TARGET"; then
+  error "fetching from remote '$REMOTE_TARGET' failed"
   exit 1
 fi
 
@@ -179,51 +280,64 @@ if [[ -z $BASE_BRANCH ]]; then
   if [[ -n $REMOTE_DEFAULT ]]; then
     BASE_BRANCH=$REMOTE_DEFAULT
   else
-    echo "ERROR: cannot detect base branch: default branch of remote '$REMOTE_TARGET' is unknown." >&2
-    echo "Pass -b <branch>, or run: git remote set-head $REMOTE_TARGET --auto" >&2
+    error "cannot detect base branch: default branch of remote '$REMOTE_TARGET' is unknown"
+    hint "pass -b <branch>, or run: git remote set-head $REMOTE_TARGET --auto"
     exit 1
   fi
 fi
 
-status=0   # becomes 2 on partial cleanup, see usage
+status=0             # becomes 2 on partial cleanup, see usage
+remote_skip=""       # reason why remote cleanup is skipped, if it is
 
 # Always protect the base branch and the remote's default branch
-ensure_protected "$BASE_BRANCH" "Base branch '$BASE_BRANCH'"
+ensure_protected "$BASE_BRANCH" "base branch '$BASE_BRANCH'"
 if [[ -z $REMOTE_DEFAULT ]]; then
-  echo "WARNING: default branch of remote '$REMOTE_TARGET' is unknown, so it cannot be protected;" \
-    "remote branches will NOT be deleted. Fix with: git remote set-head $REMOTE_TARGET <branch>" >&2
+  warn "default branch of remote '$REMOTE_TARGET' is unknown, so it cannot be protected;" \
+    "remote branches will NOT be deleted"
+  hint "set it with: git remote set-head $REMOTE_TARGET <branch>"
+  remote_skip="skipped: default branch of the remote is unknown"
   status=2
 elif [[ $REMOTE_DEFAULT != "$BASE_BRANCH" ]]; then
-  ensure_protected "$REMOTE_DEFAULT" "Default branch '$REMOTE_DEFAULT' of remote '$REMOTE_TARGET'"
+  ensure_protected "$REMOTE_DEFAULT" "default branch '$REMOTE_DEFAULT' of remote '$REMOTE_TARGET'"
 fi
 
 # The base branch must exist locally, on the remote, or both
 local_base="refs/heads/$BASE_BRANCH"
 remote_base="refs/remotes/$REMOTE_TARGET/$BASE_BRANCH"
+local_base_name=$BASE_BRANCH
 has_local_base=false
 has_remote_base=false
 git rev-parse --verify --quiet "$local_base^{commit}" >/dev/null && has_local_base=true
 git rev-parse --verify --quiet "$remote_base^{commit}" >/dev/null && has_remote_base=true
 if ! $has_local_base && ! $has_remote_base; then
-  echo "ERROR: base branch '$BASE_BRANCH' exists neither locally nor on remote '$REMOTE_TARGET'" >&2
+  error "base branch '$BASE_BRANCH' exists neither locally nor on remote '$REMOTE_TARGET'"
   exit 1
 fi
 if ! $has_local_base; then
-  echo "NOTE: no local branch '$BASE_BRANCH'; checking local branches against '$REMOTE_TARGET/$BASE_BRANCH'" >&2
+  note "no local branch '$BASE_BRANCH'; checking local branches against '$REMOTE_TARGET/$BASE_BRANCH'"
   local_base=$remote_base
+  local_base_name="$REMOTE_TARGET/$BASE_BRANCH"
 fi
 if ! $has_remote_base; then
-  echo "WARNING: base branch '$BASE_BRANCH' does not exist on remote '$REMOTE_TARGET';" \
-    "remote branches will NOT be deleted" >&2
+  warn "base branch '$BASE_BRANCH' does not exist on remote '$REMOTE_TARGET';" \
+    "remote branches will NOT be deleted"
+  remote_skip="skipped: base branch does not exist on the remote"
   status=2
 fi
 
-echo "Base branch: $BASE_BRANCH"
-echo "Remote target: $REMOTE_TARGET"
-echo "Protected branches: $PROTECTED_BRANCHES"
-$DRYRUN && echo "Dry run enabled — no branches will be deleted."
+# ---- Header
 
-# Local branches
+if $DRYRUN; then
+  echo "${O_BOLD}Merged branch cleanup${O_RESET} ${O_YELLOW}(dry run: nothing will be deleted)${O_RESET}"
+else
+  echo "${O_BOLD}Merged branch cleanup${O_RESET}"
+fi
+echo "  remote     $REMOTE_TARGET"
+echo "  base       $BASE_BRANCH"
+echo "  protected  $PROTECTED_BRANCHES"
+
+# ---- Local branches
+
 current_ref=$(git symbolic-ref --quiet HEAD || true)  # empty on detached HEAD
 refs=$(git for-each-ref --format='%(refname)%09%(worktreepath)' \
   --merged "$local_base" refs/heads/)
@@ -232,77 +346,104 @@ while IFS=$'\t' read -r ref worktree; do
   [[ -z $ref ]] && continue
   branch=${ref#refs/heads/}
   if [[ $ref == "$current_ref" ]]; then
-    echo "Skipping '$branch': currently checked out" >&2
-    continue
+    skip "$branch" "currently checked out"
+  elif [[ $branch == "$BASE_BRANCH" ]]; then
+    skip "$branch" "base branch"
+  elif is_protected "$branch"; then
+    skip "$branch" "protected"
+  elif [[ -n $worktree ]]; then
+    skip "$branch" "checked out in worktree $worktree"
+  else
+    local_branches+=("$branch")
   fi
-  if [[ $branch == "$BASE_BRANCH" ]]; then
-    echo "Skipping '$branch': base branch" >&2
-    continue
-  fi
-  if is_protected "$branch"; then
-    echo "Skipping '$branch': protected" >&2
-    continue
-  fi
-  if [[ -n $worktree ]]; then
-    echo "Skipping '$branch': checked out in worktree $worktree" >&2
-    continue
-  fi
-  local_branches+=("$branch")
 done <<< "$refs"
 
-if (( ${#local_branches[@]} )); then
+for branch in "${local_branches[@]}"; do
   if $DRYRUN; then
-    echo "Would delete local branches:"
-    printf '  %s\n' "${local_branches[@]}"
-  else
-    DELETION_STARTED=true
-    for branch in "${local_branches[@]}"; do
-      if ! git branch -d "$branch"; then
-        echo "ERROR: failed to delete local branch '$branch'" >&2
-        status=2
-      fi
-    done
-  fi
-fi
-
-# Remote branches (skipped entirely if the remote's default branch is unknown
-# or the base branch does not exist on the remote)
-remote_prefix="refs/remotes/$REMOTE_TARGET/"
-refs=""
-if [[ -n $REMOTE_DEFAULT ]] && $has_remote_base; then
-  refs=$(git for-each-ref --format='%(refname)' \
-    --merged "$remote_base" "$remote_prefix")
-fi
-remote_branches=()
-while IFS= read -r ref; do
-  [[ -z $ref ]] && continue
-  branch=${ref#"$remote_prefix"}
-  [[ $branch == HEAD ]] && continue
-  if [[ $branch == "$BASE_BRANCH" ]]; then
-    echo "Skipping '$REMOTE_TARGET/$branch': base branch" >&2
+    add_row "$branch" "would delete" "$O_GREEN"
+    n_deleted=$(( n_deleted + 1 ))
     continue
   fi
-  if is_protected "$branch"; then
-    echo "Skipping '$REMOTE_TARGET/$branch': protected" >&2
-    continue
-  fi
-  remote_branches+=("$branch")
-done <<< "$refs"
-
-if (( ${#remote_branches[@]} )); then
-  if $DRYRUN; then
-    echo "Would delete remote branches:"
-    printf '  %s\n' "${remote_branches[@]}"
+  DELETION_STARTED=true
+  if out=$(git branch -d "$branch" 2>&1); then
+    add_row "$branch" "deleted" "$O_GREEN"
+    n_deleted=$(( n_deleted + 1 ))
   else
+    out=${out%%$'\n'*}   # first line of git's message, e.g. "error: ... not fully merged"
+    add_row "$branch" "failed: ${out#error: }" "$O_RED"
+    n_failed=$(( n_failed + 1 ))
+    status=2
+  fi
+done
+add_skip_rows
+print_section "Local branches merged into $local_base_name"
+
+# ---- Remote branches (skipped entirely if the remote's default branch is
+# unknown or the base branch does not exist on the remote)
+
+remote_title="Branches on remote '$REMOTE_TARGET' merged into $REMOTE_TARGET/$BASE_BRANCH"
+if [[ -n $remote_skip ]]; then
+  print_section "$remote_title" "$remote_skip (see warning above)"
+else
+  remote_prefix="refs/remotes/$REMOTE_TARGET/"
+  refs=$(git for-each-ref --format='%(refname)' --merged "$remote_base" "$remote_prefix")
+  remote_branches=()
+  while IFS= read -r ref; do
+    [[ -z $ref ]] && continue
+    branch=${ref#"$remote_prefix"}
+    if [[ $branch == HEAD ]]; then
+      continue
+    elif [[ $branch == "$BASE_BRANCH" ]]; then
+      skip "$branch" "base branch"
+    elif is_protected "$branch"; then
+      skip "$branch" "protected"
+    else
+      remote_branches+=("$branch")
+    fi
+  done <<< "$refs"
+
+  push_out=""
+  if (( ${#remote_branches[@]} )) && ! $DRYRUN; then
     DELETION_STARTED=true
-    if ! git push "$REMOTE_TARGET" --delete "${remote_branches[@]}"; then
-      echo "ERROR: deleting branches on remote '$REMOTE_TARGET' failed (see git output above)" >&2
+    echo
+    echo "${O_DIM}Deleting $(branches ${#remote_branches[@]}) on '$REMOTE_TARGET' ...${O_RESET}"
+    if ! push_out=$(git push --quiet "$REMOTE_TARGET" --delete "${remote_branches[@]}" 2>&1); then
       status=2
     fi
   fi
+  for branch in "${remote_branches[@]}"; do
+    if $DRYRUN; then
+      add_row "$branch" "would delete" "$O_GREEN"
+      n_deleted=$(( n_deleted + 1 ))
+    # A successful push also removes the remote-tracking ref
+    elif git rev-parse --verify --quiet "$remote_prefix$branch" >/dev/null; then
+      add_row "$branch" "failed (see git output below)" "$O_RED"
+      n_failed=$(( n_failed + 1 ))
+    else
+      add_row "$branch" "deleted" "$O_GREEN"
+      n_deleted=$(( n_deleted + 1 ))
+    fi
+  done
+  add_skip_rows
+  print_section "$remote_title"
+  if (( status != 0 )) && [[ -n $push_out ]]; then
+    echo
+    echo "${O_DIM}git push output:${O_RESET}"
+    while IFS= read -r line; do echo "  ${O_DIM}$line${O_RESET}"; done <<< "$push_out"
+  fi
 fi
 
+# ---- Summary
+
+echo
+if $DRYRUN; then
+  summary="$(branches "$n_deleted") would be deleted, $n_skipped skipped"
+else
+  summary="$(branches "$n_deleted") deleted, $n_failed failed, $n_skipped skipped"
+fi
 if (( status != 0 )); then
-  echo "Cleanup finished with errors (exit status $status)." >&2
+  echo "${O_BOLD}Summary:${O_RESET} $summary ${O_RED}(finished with errors, exit status $status)${O_RESET}"
+else
+  echo "${O_BOLD}Summary:${O_RESET} $summary"
 fi
 exit "$status"
