@@ -4,64 +4,110 @@
 #
 # Copyright(c) 2026       Christoph Niethammer <christoph.niethammer@gmail.com>
 #
+set -e
+
+OUTPUT_DIR=""
+PREFIX=""
+FORCE=false
 
 usage() {
     cat <<EOF
-Usage: $0 [OPTIONS] COMMIT
+Usage: $0 [OPTIONS] [COMMIT]
 
 Create a tar.gz archive from a git commit.
   COMMIT       Commit, tag, or ref (default: HEAD)
 
 Options:
   -o, --output-dir <dir>   Output directory (default: parent of repo)
-  -p, --prefix <prefix>    Custom archive prefix (default: auto-generated)
+  -p, --prefix <prefix>    Custom archive prefix, used as top-level directory
+                           in the archive and as file name (default:
+                           <repo>-<commit date>-<git describe>)
+  -f, --force              Overwrite an existing archive
   -h, --help               Show this help
+
+Notes:
+  Only committed content is archived; uncommitted changes are not included.
+  Submodule contents are not included (a limitation of git archive).
 EOF
 }
 
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
 # Parse arguments with getopt
-TEMP=$(getopt -o o:p:h --long output-dir:,prefix:,help -n "$0" -- "$@")
-# shellcheck disable="SC2181"
-if [ $? != 0 ]; then usage; exit 1; fi
-# shellcheck enable="SC2181"
+if ! TEMP=$(getopt -o o:p:fh --long output-dir:,prefix:,force,help -n "$0" -- "$@"); then
+    usage >&2
+    exit 1
+fi
 eval set -- "$TEMP"
 
 while true; do
   case "$1" in
     -o|--output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     -p|--prefix) PREFIX="$2"; shift 2 ;;
+    -f|--force) FORCE=true; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
-    *) echo "Invalid option: $1"; usage; exit 1 ;;
+    *) echo "Invalid option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
 
-COMMIT="$1"
-if [[ -z "$COMMIT" ]]; then
-  COMMIT="HEAD"
-fi
-
-if ! git rev-parse --verify "$COMMIT^{commit}" >/dev/null 2>&1; then
-    echo "Error: Invalid commit or ref: $COMMIT"
+if (( $# > 1 )); then
+    echo "Error: too many arguments: $*" >&2
+    usage >&2
     exit 1
 fi
+COMMIT="${1:-HEAD}"
 
+if ! REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
+    die "not inside a git work tree"
+fi
 
-REPO_ROOT=$(git rev-parse --show-toplevel)
-if [[ -z "$PREFIX" ]]; then
+if ! git rev-parse --verify --quiet "$COMMIT^{commit}" >/dev/null; then
+    die "invalid commit or ref: $COMMIT"
+fi
+
+if [[ -n "$PREFIX" ]]; then
+    if [[ "$PREFIX" == */* || "$PREFIX" == . || "$PREFIX" == .. ]]; then
+        die "prefix must be a plain name without '/': $PREFIX"
+    fi
+else
     REPO_NAME=$(basename "$REPO_ROOT")
-    COMMIT_DATE=$(git show -s --format=%ci "$COMMIT" | awk '{print $1}')
-    ABBREV_COMMIT=$(git describe --tags --always "$COMMIT")
-    PREFIX="${REPO_NAME}-${COMMIT_DATE}-${ABBREV_COMMIT}"
+    # %cs: committer date as YYYY-MM-DD; ^{commit} also resolves annotated tags
+    COMMIT_DATE=$(git log -1 --format=%cs "$COMMIT^{commit}")
+    ABBREV_COMMIT=$(git describe --tags --always "$COMMIT^{commit}")
+    PREFIX="${REPO_NAME}-${COMMIT_DATE}-${ABBREV_COMMIT//\//-}"   # tag "a/b" -> "a-b"
 fi
 
 if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="$(dirname "$REPO_ROOT")"
 fi
+[[ -d "$OUTPUT_DIR" ]] || die "output directory does not exist: $OUTPUT_DIR"
+[[ -w "$OUTPUT_DIR" ]] || die "output directory is not writable: $OUTPUT_DIR"
 
 ARCHIVE_PATH="${OUTPUT_DIR}/${PREFIX}.tar.gz"
+if [[ -e "$ARCHIVE_PATH" ]] && ! $FORCE; then
+    die "archive already exists: $ARCHIVE_PATH (use --force to overwrite)"
+fi
 
+# Uncommitted changes are not part of the archive; point that out for HEAD
+if [[ "$(git rev-parse "$COMMIT^{commit}")" == "$(git rev-parse HEAD 2>/dev/null)" ]] &&
+   [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+    echo "Note: the working tree has uncommitted changes; they are not included" >&2
+fi
 
-git archive --format=tar.gz --prefix="${PREFIX}/" "$COMMIT" > "$ARCHIVE_PATH"
+# Write to a temporary file first and move it into place only on success,
+# so a failure never leaves a truncated archive under the final name
+TMP_ARCHIVE=$(mktemp "${OUTPUT_DIR}/.${PREFIX}.tar.gz.XXXXXX") ||
+    die "cannot create temporary file in $OUTPUT_DIR"
+trap 'rm -f "$TMP_ARCHIVE"' EXIT
+
+if ! git archive --format=tar.gz --prefix="${PREFIX}/" "$COMMIT" > "$TMP_ARCHIVE"; then
+    die "git archive failed"
+fi
+mv -f "$TMP_ARCHIVE" "$ARCHIVE_PATH" || die "cannot move archive to $ARCHIVE_PATH"
+chmod "$(printf '%o' $(( 0666 & ~0$(umask) )))" "$ARCHIVE_PATH"   # mktemp creates 0600
 
 echo "Created archive: $ARCHIVE_PATH"
