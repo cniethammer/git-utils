@@ -41,6 +41,7 @@ REMOTE_TARGET=""   # empty: detect (push remote, upstream, sole remote, origin)
 DRYRUN=false
 PROTECTED_BRANCHES="main|master|develop"
 COLOR=auto
+SCOPE=all   # all, local or remote
 
 usage() {
   echo "Usage: ${0##*/} [options]"
@@ -52,6 +53,8 @@ usage() {
   echo "  -n, --dry-run             Preview which branches would be deleted without deleting"
   echo "  -p, --protected <regex>   Regex of branches to protect from deletion (default: $PROTECTED_BRANCHES)"
   echo "  -r, --remote <remote>     Remote target to update (default: push remote of the current branch)"
+  echo "  -L, --local-only          Only delete local branches"
+  echo "  -R, --remote-only         Only delete branches on the remote"
   echo "      --color[=<when>]      Colorize output: always, never or auto (default: auto)"
   echo "  -h, --help                Show this help"
   echo
@@ -192,12 +195,21 @@ print_section() {
   ROW_NAMES=() ROW_STATES=() ROW_COLORS=()
 }
 
+# Restrict the cleanup to "local" or "remote"; the two are mutually exclusive
+set_scope() {
+  if [[ $SCOPE != all && $SCOPE != "$1" ]]; then
+    error "--local-only and --remote-only cannot be combined"
+    exit 1
+  fi
+  SCOPE=$1
+}
+
 # "1 branch", "2 branches"
 branches() { if (( $1 == 1 )); then echo "1 branch"; else echo "$1 branches"; fi; }
 
 # ---- Arguments
 
-if ! TEMP=$(getopt -o b:np:r:h --long base:,dry-run,protected:,remote:,color::,help -n "${0##*/}" -- "$@"); then
+if ! TEMP=$(getopt -o b:np:r:hLR --long base:,dry-run,protected:,remote:,local-only,remote-only,color::,help -n "${0##*/}" -- "$@"); then
   usage >&2
   exit 1
 fi
@@ -209,6 +221,8 @@ while true; do
     -n|--dry-run) DRYRUN=true; shift ;;
     -p|--protected) PROTECTED_BRANCHES="$2"; shift 2 ;;
     -r|--remote) REMOTE_TARGET=$2; shift 2 ;;
+    -L|--local-only) set_scope local; shift ;;
+    -R|--remote-only) set_scope remote; shift ;;
     --color)
       case ${2:-always} in   # plain --color means always, like git
         always|never|auto) COLOR=${2:-always} ;;
@@ -291,12 +305,23 @@ remote_skip=""       # reason why remote cleanup is skipped, if it is
 
 # Always protect the base branch and the remote's default branch
 ensure_protected "$BASE_BRANCH" "base branch '$BASE_BRANCH'"
+# A problem on the remote side only matters if the remote is cleaned up:
+# with --remote-only it is an error, with --local-only just a note
 if [[ -z $REMOTE_DEFAULT ]]; then
-  warn "default branch of remote '$REMOTE_TARGET' is unknown, so it cannot be protected;" \
-    "remote branches will NOT be deleted"
-  hint "set it with: git remote set-head $REMOTE_TARGET <branch>"
-  remote_skip="skipped: default branch of the remote is unknown"
-  status=2
+  case $SCOPE in
+    remote)
+      error "default branch of remote '$REMOTE_TARGET' is unknown, so it cannot be protected"
+      hint "set it with: git remote set-head $REMOTE_TARGET <branch>"
+      exit 1 ;;
+    local)
+      note "default branch of remote '$REMOTE_TARGET' is unknown and not protected automatically" ;;
+    all)
+      warn "default branch of remote '$REMOTE_TARGET' is unknown, so it cannot be protected;" \
+        "remote branches will NOT be deleted"
+      hint "set it with: git remote set-head $REMOTE_TARGET <branch>"
+      remote_skip="skipped: default branch of the remote is unknown"
+      status=2 ;;
+  esac
 elif [[ $REMOTE_DEFAULT != "$BASE_BRANCH" ]]; then
   ensure_protected "$REMOTE_DEFAULT" "default branch '$REMOTE_DEFAULT' of remote '$REMOTE_TARGET'"
 fi
@@ -313,16 +338,21 @@ if ! $has_local_base && ! $has_remote_base; then
   error "base branch '$BASE_BRANCH' exists neither locally nor on remote '$REMOTE_TARGET'"
   exit 1
 fi
-if ! $has_local_base; then
+if ! $has_local_base && [[ $SCOPE != remote ]]; then
   note "no local branch '$BASE_BRANCH'; checking local branches against '$REMOTE_TARGET/$BASE_BRANCH'"
   local_base=$remote_base
   local_base_name="$REMOTE_TARGET/$BASE_BRANCH"
 fi
 if ! $has_remote_base; then
-  warn "base branch '$BASE_BRANCH' does not exist on remote '$REMOTE_TARGET';" \
-    "remote branches will NOT be deleted"
-  remote_skip="skipped: base branch does not exist on the remote"
-  status=2
+  if [[ $SCOPE == remote ]]; then
+    error "base branch '$BASE_BRANCH' does not exist on remote '$REMOTE_TARGET'"
+    exit 1
+  elif [[ $SCOPE == all ]]; then
+    warn "base branch '$BASE_BRANCH' does not exist on remote '$REMOTE_TARGET';" \
+      "remote branches will NOT be deleted"
+    remote_skip="skipped: base branch does not exist on the remote"
+    status=2
+  fi
 fi
 
 # ---- Header
@@ -335,54 +365,62 @@ fi
 echo "  remote     $REMOTE_TARGET"
 echo "  base       $BASE_BRANCH"
 echo "  protected  $PROTECTED_BRANCHES"
+case $SCOPE in
+  local)  echo "  scope      local branches only" ;;
+  remote) echo "  scope      remote branches only" ;;
+esac
 
 # ---- Local branches
 
-current_ref=$(git symbolic-ref --quiet HEAD || true)  # empty on detached HEAD
-refs=$(git for-each-ref --format='%(refname)%09%(worktreepath)' \
-  --merged "$local_base" refs/heads/)
-local_branches=()
-while IFS=$'\t' read -r ref worktree; do
-  [[ -z $ref ]] && continue
-  branch=${ref#refs/heads/}
-  if [[ $ref == "$current_ref" ]]; then
-    skip "$branch" "currently checked out"
-  elif [[ $branch == "$BASE_BRANCH" ]]; then
-    skip "$branch" "base branch"
-  elif is_protected "$branch"; then
-    skip "$branch" "protected"
-  elif [[ -n $worktree ]]; then
-    skip "$branch" "checked out in worktree $worktree"
-  else
-    local_branches+=("$branch")
-  fi
-done <<< "$refs"
+if [[ $SCOPE != remote ]]; then
+  current_ref=$(git symbolic-ref --quiet HEAD || true)  # empty on detached HEAD
+  refs=$(git for-each-ref --format='%(refname)%09%(worktreepath)' \
+    --merged "$local_base" refs/heads/)
+  local_branches=()
+  while IFS=$'\t' read -r ref worktree; do
+    [[ -z $ref ]] && continue
+    branch=${ref#refs/heads/}
+    if [[ $ref == "$current_ref" ]]; then
+      skip "$branch" "currently checked out"
+    elif [[ $branch == "$BASE_BRANCH" ]]; then
+      skip "$branch" "base branch"
+    elif is_protected "$branch"; then
+      skip "$branch" "protected"
+    elif [[ -n $worktree ]]; then
+      skip "$branch" "checked out in worktree $worktree"
+    else
+      local_branches+=("$branch")
+    fi
+  done <<< "$refs"
 
-for branch in "${local_branches[@]}"; do
-  if $DRYRUN; then
-    add_row "$branch" "would delete" "$O_GREEN"
-    n_deleted=$(( n_deleted + 1 ))
-    continue
-  fi
-  DELETION_STARTED=true
-  if out=$(git branch -d "$branch" 2>&1); then
-    add_row "$branch" "deleted" "$O_GREEN"
-    n_deleted=$(( n_deleted + 1 ))
-  else
-    out=${out%%$'\n'*}   # first line of git's message, e.g. "error: ... not fully merged"
-    add_row "$branch" "failed: ${out#error: }" "$O_RED"
-    n_failed=$(( n_failed + 1 ))
-    status=2
-  fi
-done
-add_skip_rows
-print_section "Local branches merged into $local_base_name"
+  for branch in "${local_branches[@]}"; do
+    if $DRYRUN; then
+      add_row "$branch" "would delete" "$O_GREEN"
+      n_deleted=$(( n_deleted + 1 ))
+      continue
+    fi
+    DELETION_STARTED=true
+    if out=$(git branch -d "$branch" 2>&1); then
+      add_row "$branch" "deleted" "$O_GREEN"
+      n_deleted=$(( n_deleted + 1 ))
+    else
+      out=${out%%$'\n'*}   # first line of git's message, e.g. "error: ... not fully merged"
+      add_row "$branch" "failed: ${out#error: }" "$O_RED"
+      n_failed=$(( n_failed + 1 ))
+      status=2
+    fi
+  done
+  add_skip_rows
+  print_section "Local branches merged into $local_base_name"
+fi
 
 # ---- Remote branches (skipped entirely if the remote's default branch is
 # unknown or the base branch does not exist on the remote)
 
 remote_title="Branches on remote '$REMOTE_TARGET' merged into $REMOTE_TARGET/$BASE_BRANCH"
-if [[ -n $remote_skip ]]; then
+if [[ $SCOPE == local ]]; then
+  :   # --local-only
+elif [[ -n $remote_skip ]]; then
   print_section "$remote_title" "$remote_skip (see warning above)"
 else
   remote_prefix="refs/remotes/$REMOTE_TARGET/"
